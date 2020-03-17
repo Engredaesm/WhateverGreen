@@ -58,7 +58,7 @@ void IGFX::init() {
 	callbackIGFX = this;
 
 	int canLoadGuC = 0;
-	if (getKernelVersion() >= KernelVersion::HighSierra && getKernelVersion() <= KernelVersion::Mojave)
+	if (getKernelVersion() >= KernelVersion::HighSierra)
 		PE_parse_boot_argn("igfxfw", &canLoadGuC, sizeof(canLoadGuC));
 
 	uint32_t family = 0, model = 0;
@@ -127,6 +127,18 @@ void IGFX::init() {
 			currentGraphics = &kextIntelICL;
 			currentFramebuffer = &kextIntelICLLPFb;
 			currentFramebufferOpt = &kextIntelICLHPFb;
+			forceCompleteModeset.enable = true;
+			break;
+		case CPUInfo::CpuGeneration::CometLake:
+			avoidFirmwareLoading = getKernelVersion() >= KernelVersion::HighSierra;
+			loadGuCFirmware = canLoadGuC > 0;
+			currentGraphics = &kextIntelKBL;
+			currentFramebuffer = &kextIntelCFLFb;
+			// Allow faking ask KBL
+			currentFramebufferOpt = &kextIntelKBLFb;
+			// Note, several CFL GPUs are completely broken. They freeze in IGMemoryManager::initCache due to incompatible
+			// configuration, supposedly due to Apple not supporting new MOCS table and forcing Skylake-based format.
+			// See: https://github.com/torvalds/linux/blob/135c5504a600ff9b06e321694fbcac78a9530cd4/drivers/gpu/drm/i915/intel_mocs.c#L181
 			forceCompleteModeset.enable = true;
 			break;
 		default:
@@ -315,7 +327,7 @@ bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 			patcher.routeMultiple(index, &request, 1, address, size);
 		}
 
-		if (forceOpenGL || moderniseAccelerator || (avoidFirmwareLoading && getKernelVersion() <= KernelVersion::Mojave)) {
+		if (forceOpenGL || moderniseAccelerator || avoidFirmwareLoading) {
 			auto startSym = "__ZN16IntelAccelerator5startEP9IOService";
 			if (cpuGeneration == CPUInfo::CpuGeneration::SandyBridge)
 				startSym = "__ZN16IntelAccelerator5startEP9IOService";
@@ -323,31 +335,8 @@ bool IGFX::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t a
 			KernelPatcher::RouteRequest request(startSym, wrapAcceleratorStart, orgAcceleratorStart);
 			patcher.routeMultiple(index, &request, 1, address, size);
 
-			if (loadGuCFirmware)
+			if (loadGuCFirmware && getKernelVersion() <= KernelVersion::Mojave)
 				loadIGScheduler4Patches(patcher, index, address, size);
-		}
-
-		// On 10.15 GraphicsSchedulerSelect 2 is removed, so we disable it by manually patching default flags.
-		if (avoidFirmwareLoading && getKernelVersion() > KernelVersion::Mojave) {
-			auto sym = patcher.solveSymbol<uint8_t *>(index, "__ZN16IntelAccelerator19populateAccelConfigEP13IOAccelConfig", address, size);
-			if (sym) {
-				for (size_t i = 0; i < 4096; i++, sym++) {
-					if (sym[0] == 0x00 && sym[1] == 0x00 && sym[2] == 0x18 && sym[3] == 0x00) {
-						DBGLOG("igfx", "found GuC accel config at " PRIKADDR, CASTKADDR(sym));
-						auto status = MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock);
-						if (status == KERN_SUCCESS) {
-							sym[2] = 0x28;
-							MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
-						} else {
-							SYSLOG("igfx", "GuC accel config protection upgrade failure %d", status);
-						}
-						break;
-					}
-				}
-			} else {
-				SYSLOG("igfx", "failed to solve populateAccelConfig");
-				patcher.clearError();
-			}
 		}
 
 		if (readDescriptorPatch) {
@@ -649,8 +638,8 @@ bool IGFX::wrapAcceleratorStart(IOService *that, IOService *provider) {
 	// On KBL they do it unconditionally, which causes infinite loop.
 	// On 10.13 there is an option to ignore/load a generic firmware, which we set here.
 	// On 10.12 it is not necessary.
-	// On 10.15 a different route is used, as GuC firmware loading is completely removed.
-	if (callbackIGFX->avoidFirmwareLoading && getKernelVersion() <= KernelVersion::Mojave) {
+	// On 10.15 an option is differently named but still there.
+	if (callbackIGFX->avoidFirmwareLoading) {
 		auto dev = OSDynamicCast(OSDictionary, that->getProperty("Development"));
 		if (dev && dev->getObject("GraphicsSchedulerSelect")) {
 			auto rawDev = dev->copyCollection();
@@ -661,7 +650,15 @@ bool IGFX::wrapAcceleratorStart(IOService *that, IOService *provider) {
 					// 2 - Force disable via plist (removed as of 10.15)
 					// 3 - Apple Scheduler
 					// 4 - Reference Scheduler
-					auto num = OSNumber::withNumber(callbackIGFX->loadGuCFirmware ? 4 : 2, 32);
+					// 5 - Host Preemptive (as of 10.15)
+					uint32_t scheduler;
+					if (callbackIGFX->loadGuCFirmware)
+						scheduler = 4;
+					else if (getKernelVersion() >= KernelVersion::Catalina)
+						scheduler = 5;
+					else
+						scheduler = 2;
+					auto num = OSNumber::withNumber(scheduler, 32);
 					if (num) {
 						newDev->setObject("GraphicsSchedulerSelect", num);
 						num->release();
@@ -755,10 +752,10 @@ IOReturn IGFX::wrapReadAUX(void *that, IORegistryEntry *framebuffer, uint32_t ad
 
 	// Guard: Check the DPCD register address
 	// The first 16 fields of the receiver capabilities reside at 0x0 (DPCD Register Address)
-	if (address != 0)
+	if (address != DPCD_DEFAULT_ADDRESS && address != DPCD_EXTENDED_ADDRESS)
 		return retVal;
 
-	// The driver tries to read the first 16 bytes from DPCD
+	// The driver tries to read the first 16 bytes from DPCD (0x0000) or extended DPCD (0x2200)
 	// Get the current framebuffer index (An UInt32 field at 0x1dc in a framebuffer instance)
 	// We read the value of "IOFBDependentIndex" instead of accessing that field directly
 	uint32_t index;
